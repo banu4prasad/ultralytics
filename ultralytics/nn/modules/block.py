@@ -439,115 +439,126 @@ class C3Ghost(C3):
 
 
 class GhostBottleneck(nn.Module):
-    """
-    GhostNetV2 Bottleneck with attention mechanism.
-    
-    Enhanced version of Ghost Bottleneck with optional SE and attention-based ghost modules.
-    
-    Attributes:
-        stride (int): Stride for downsampling.
-        ghost1 (GhostConvV2): First ghost convolution (expansion).
-        conv_dw (nn.Conv2d | None): Depthwise convolution for stride > 1.
-        bn_dw (nn.BatchNorm2d | None): Batch normalization for depthwise conv.
-        se (SqueezeExcite | None): Squeeze-and-excitation module.
-        ghost2 (GhostConvV2): Second ghost convolution (projection).
-        shortcut (nn.Sequential): Shortcut connection.
-    
-    References:
-        https://github.com/huawei-noah/Efficient-AI-Backbones
-    """
-    
-    def __init__(self, c1, c2, mid_c=None, k=3, s=1, se_ratio=0., layer_id=0):
+    """Ghost Bottleneck V3 with re-parameterization support."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, se_ratio: float = 0.0, layer_id: int = 0):
         """
-        Initialize GhostNetV2 Bottleneck.
-        
+        Initialize Ghost Bottleneck V3 module.
+
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
-            mid_c (int | None): Middle channels. If None, uses c2.
-            k (int): Kernel size for depthwise convolution.
+            k (int): Kernel size.
             s (int): Stride.
-            se_ratio (float): Squeeze-excitation ratio (0 to disable).
-            layer_id (int): Layer index (determines attention mode).
+            se_ratio (float): Squeeze-and-excitation ratio.
+            layer_id (int): Layer identifier for determining module type.
         """
         super().__init__()
-        if mid_c is None:
-            mid_c = c2
-        
         has_se = se_ratio is not None and se_ratio > 0.
         self.stride = s
-        
-        # Determine mode based on layer_id
-        mode = 'original' if layer_id <= 1 else 'attn'
-        
-        # Point-wise expansion with GhostConvV2
-        self.ghost1 = GhostConv(c1, mid_c, k=1, s=1, act=True, mode=mode)
-        
+
+        # Calculate middle channels (expansion)
+        mid_chs = c2 * 2  # Expansion ratio
+
+        # Point-wise expansion - use GhostConv instead of GhostModule
+        self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
+
         # Depth-wise convolution
         if self.stride > 1:
-            self.conv_dw = nn.Conv2d(
-                mid_c, mid_c, k, stride=s,
-                padding=(k - 1) // 2, groups=mid_c, bias=False
-            )
-            self.bn_dw = nn.BatchNorm2d(mid_c)
+            self.conv_dw = nn.Conv2d(mid_chs, mid_chs, k, stride=s,
+                                   padding=(k-1)//2, groups=mid_chs, bias=False)
+            self.bn_dw = nn.BatchNorm2d(mid_chs)
         else:
             self.conv_dw = None
             self.bn_dw = None
-        
+
         # Squeeze-and-excitation
         if has_se:
-            from ultralytics.nn.modules.conv import ChannelAttention
-            # Use a simplified SE - you can also use the full SqueezeExcite from ghostnetv2_torch.py
-            self.se = ChannelAttention(mid_c)
+            self.se = SqueezeExcite(mid_chs, se_ratio=se_ratio)
         else:
             self.se = None
+
+        # Point-wise linear projection
+        self.ghost2 = GhostConv(mid_chs, c2, k=1, act=False)
         
-        # Point-wise projection
-        self.ghost2 = GhostConv(mid_c, c2, k=1, s=1, act=False, mode='original')
-        
-        # Shortcut
-        if c1 == c2 and self.stride == 1:
-            self.shortcut = nn.Identity()
+        # Shortcut connection
+        if (c1 == c2 and self.stride == 1):
+            self.shortcut = nn.Sequential()
         else:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(c1, c1, k, stride=s, padding=(k - 1) // 2, 
-                         groups=c1, bias=False),
+                nn.Conv2d(c1, c1, k, stride=s, padding=(k-1)//2, groups=c1, bias=False),
                 nn.BatchNorm2d(c1),
                 nn.Conv2d(c1, c2, 1, stride=1, padding=0, bias=False),
                 nn.BatchNorm2d(c2),
             )
-    
-    def forward(self, x):
-        """
-        Forward pass through GhostNetV2 Bottleneck.
-        
-        Args:
-            x (torch.Tensor): Input tensor.
-        
-        Returns:
-            (torch.Tensor): Output tensor with residual connection.
-        """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply skip connection and concatenation to input tensor."""
         residual = x
-        
-        # Expansion
+
+        # 1st ghost bottleneck (expansion)
         x = self.ghost1(x)
-        
-        # Depthwise
+
+        # Depth-wise convolution
         if self.stride > 1:
             x = self.conv_dw(x)
             x = self.bn_dw(x)
-        
+
         # Squeeze-and-excitation
         if self.se is not None:
             x = self.se(x)
-        
-        # Projection
+
+        # 2nd ghost bottleneck (compression)
         x = self.ghost2(x)
         
-        # Residual
-        x += self.shortcut(residual)
+        return x + self.shortcut(residual)
+
+
+# Remove the old SqueezeExcite class and update it with proper typing
+class SqueezeExcite(nn.Module):
+    """Squeeze-and-Excite attention module."""
+    
+    def __init__(self, in_chs: int, se_ratio: float = 0.25, reduced_base_chs: int | None = None,
+                 act_layer: type[nn.Module] = nn.ReLU, gate_fn = None, divisor: int = 4):
+        """
+        Initialize SqueezeExcite module.
         
-        return x
+        Args:
+            in_chs (int): Input channels.
+            se_ratio (float): Squeeze ratio.
+            reduced_base_chs (int | None): Base channels for reduction.
+            act_layer (type[nn.Module]): Activation layer.
+            gate_fn: Gate function (defaults to hard_sigmoid).
+            divisor (int): Divisor for making channels divisible.
+        """
+        super().__init__()
+        if gate_fn is None:
+            # Use hard sigmoid as default
+            gate_fn = lambda x: F.relu6(x + 3.) / 6.
+        self.gate_fn = gate_fn
+        reduced_chs = self._make_divisible((reduced_base_chs or in_chs) * se_ratio, divisor)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_reduce = nn.Conv2d(in_chs, reduced_chs, 1, bias=True)
+        self.act1 = act_layer(inplace=True)
+        self.conv_expand = nn.Conv2d(reduced_chs, in_chs, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply squeeze-and-excite attention to input."""
+        x_se = self.avg_pool(x)
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
+        return x * self.gate_fn(x_se)
+
+    @staticmethod
+    def _make_divisible(v: float, divisor: int, min_value: int | None = None) -> int:
+        """Make channels divisible by divisor."""
+        if min_value is None:
+            min_value = divisor
+        new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+        if new_v < 0.9 * v:
+            new_v += divisor
+        return new_v
 
 
 class Bottleneck(nn.Module):
