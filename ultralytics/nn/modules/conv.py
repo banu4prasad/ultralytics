@@ -1,8 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Convolution modules."""
 
+from __future__ import annotations
+
 import math
-from typing import List
 
 import numpy as np
 import torch
@@ -33,6 +34,13 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
+
+def hard_sigmoid(x, inplace: bool = False):
+    """Hard sigmoid activation function."""
+    if inplace:
+        return x.add_(3.).clamp_(0., 6.).div_(6.)
+    else:
+        return F.relu6(x + 3.) / 6.
 
 
 class Conv(nn.Module):
@@ -329,21 +337,25 @@ class Focus(nn.Module):
 
 class GhostConv(nn.Module):
     """
-    Ghost Convolution module.
+    Ghost Convolution module V3 with re-parameterization support.
 
     Generates more features with fewer parameters by using cheap operations.
+    Supports training and inference modes with re-parameterization.
 
     Attributes:
-        cv1 (Conv): Primary convolution.
-        cv2 (Conv): Cheap operation convolution.
+        oup (int): Output channels.
+        infer_mode (bool): Whether in inference mode.
+        num_conv_branches (int): Number of convolution branches.
+        dconv_scale (bool): Whether to use scale in re-parameterization.
+        gate_fn (nn.Module): Gate function for attention.
 
     References:
         https://github.com/huawei-noah/Efficient-AI-Backbones
     """
 
-    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True, ratio=2, dw_size=3):
         """
-        Initialize Ghost Convolution module with given parameters.
+        Initialize Ghost Convolution V3 module.
 
         Args:
             c1 (int): Number of input channels.
@@ -352,11 +364,57 @@ class GhostConv(nn.Module):
             s (int): Stride.
             g (int): Groups.
             act (bool | nn.Module): Activation function.
+            ratio (int): Channel expansion ratio.
+            dw_size (int): Depthwise convolution kernel size.
         """
         super().__init__()
-        c_ = c2 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+        self.oup = c2
+        self.infer_mode = False
+        self.num_conv_branches = 3
+        self.dconv_scale = True
+        self.gate_fn = nn.Sigmoid()
+        
+        init_channels = math.ceil(c2 / ratio)
+        new_channels = init_channels * (ratio - 1)
+        
+        if self.infer_mode:
+            self.primary_conv = nn.Sequential(
+                nn.Conv2d(c1, init_channels, k, s, k//2, bias=False),
+                nn.BatchNorm2d(init_channels),
+                nn.ReLU(inplace=True) if act else nn.Sequential(),
+            )
+            self.cheap_operation = nn.Sequential(
+                nn.Conv2d(init_channels, new_channels, dw_size, 1, dw_size//2, groups=init_channels, bias=False),
+                nn.BatchNorm2d(new_channels),
+                nn.ReLU(inplace=True) if act else nn.Sequential(),
+            )
+        else:
+            # Re-parameterizable primary convolution
+            self.primary_rpr_skip = nn.BatchNorm2d(c1) if c1 == init_channels and s == 1 else None
+            primary_rpr_conv = []
+            for _ in range(self.num_conv_branches):
+                primary_rpr_conv.append(self._conv_bn(c1, init_channels, k, s, k//2, bias=False))
+            self.primary_rpr_conv = nn.ModuleList(primary_rpr_conv)
+            
+            self.primary_rpr_scale = None
+            if k > 1:
+                self.primary_rpr_scale = self._conv_bn(c1, init_channels, 1, 1, 0, bias=False)
+            self.primary_activation = nn.ReLU(inplace=True) if act else None
+
+            # Re-parameterizable cheap operation
+            self.cheap_rpr_skip = nn.BatchNorm2d(init_channels) if init_channels == new_channels else None
+            cheap_rpr_conv = []
+            for _ in range(self.num_conv_branches):
+                cheap_rpr_conv.append(self._conv_bn(init_channels, new_channels, dw_size, 1, dw_size//2, groups=init_channels, bias=False))
+            self.cheap_rpr_conv = nn.ModuleList(cheap_rpr_conv)
+            
+            self.cheap_rpr_scale = None
+            if dw_size > 1:
+                self.cheap_rpr_scale = self._conv_bn(init_channels, new_channels, 1, 1, 0, groups=init_channels, bias=False)
+            self.cheap_activation = nn.ReLU(inplace=True) if act else None
+            self.in_channels = init_channels
+            self.groups = init_channels
+            self.kernel_size = dw_size
 
     def forward(self, x):
         """
@@ -368,9 +426,190 @@ class GhostConv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor with concatenated features.
         """
-        y = self.cv1(x)
-        return torch.cat((y, self.cv2(y)), 1)
+        if self.infer_mode:
+            x1 = self.primary_conv(x)
+            x2 = self.cheap_operation(x1)
+        else:
+            # Primary convolution with re-parameterization
+            identity_out = 0
+            if self.primary_rpr_skip is not None:
+                identity_out = self.primary_rpr_skip(x)
+            scale_out = 0
+            if self.primary_rpr_scale is not None and self.dconv_scale:
+                scale_out = self.primary_rpr_scale(x)
+            x1 = scale_out + identity_out
+            for ix in range(self.num_conv_branches):
+                x1 += self.primary_rpr_conv[ix](x)
+            if self.primary_activation is not None:
+                x1 = self.primary_activation(x1)
 
+            # Cheap operation with re-parameterization
+            cheap_identity_out = 0
+            if self.cheap_rpr_skip is not None:
+                cheap_identity_out = self.cheap_rpr_skip(x1)
+            cheap_scale_out = 0
+            if self.cheap_rpr_scale is not None and self.dconv_scale:
+                cheap_scale_out = self.cheap_rpr_scale(x1)
+            x2 = cheap_scale_out + cheap_identity_out
+            for ix in range(self.num_conv_branches):
+                x2 += self.cheap_rpr_conv[ix](x1)
+            if self.cheap_activation is not None:
+                x2 = self.cheap_activation(x2)
+
+        return torch.cat([x1, x2], dim=1)
+
+    def reparameterize(self):
+        """
+        Re-parameterize multi-branched architecture for inference.
+        
+        Following RepVGG methodology to fuse branches into single convolutions.
+        """
+        if self.infer_mode:
+            return
+            
+        # Reparameterize primary convolution
+        primary_kernel, primary_bias = self._get_kernel_bias_primary()
+        self.primary_conv = nn.Conv2d(
+            in_channels=self.primary_rpr_conv[0].conv.in_channels,
+            out_channels=self.primary_rpr_conv[0].conv.out_channels,
+            kernel_size=self.primary_rpr_conv[0].conv.kernel_size,
+            stride=self.primary_rpr_conv[0].conv.stride,
+            padding=self.primary_rpr_conv[0].conv.padding,
+            dilation=self.primary_rpr_conv[0].conv.dilation,
+            groups=self.primary_rpr_conv[0].conv.groups,
+            bias=True
+        )
+        self.primary_conv.weight.data = primary_kernel
+        self.primary_conv.bias.data = primary_bias
+        self.primary_conv = nn.Sequential(
+            self.primary_conv,
+            self.primary_activation if self.primary_activation is not None else nn.Sequential()
+        )
+
+        # Reparameterize cheap operation
+        cheap_kernel, cheap_bias = self._get_kernel_bias_cheap()
+        self.cheap_operation = nn.Conv2d(
+            in_channels=self.cheap_rpr_conv[0].conv.in_channels,
+            out_channels=self.cheap_rpr_conv[0].conv.out_channels,
+            kernel_size=self.cheap_rpr_conv[0].conv.kernel_size,
+            stride=self.cheap_rpr_conv[0].conv.stride,
+            padding=self.cheap_rpr_conv[0].conv.padding,
+            dilation=self.cheap_rpr_conv[0].conv.dilation,
+            groups=self.cheap_rpr_conv[0].conv.groups,
+            bias=True
+        )
+        self.cheap_operation.weight.data = cheap_kernel
+        self.cheap_operation.bias.data = cheap_bias
+        self.cheap_operation = nn.Sequential(
+            self.cheap_operation,
+            self.cheap_activation if self.cheap_activation is not None else nn.Sequential()
+        )
+
+        # Delete unused branches
+        for para in self.parameters():
+            para.detach_()
+        if hasattr(self, 'primary_rpr_conv'):
+            self.__delattr__('primary_rpr_conv')
+        if hasattr(self, 'primary_rpr_scale'):
+            self.__delattr__('primary_rpr_scale')
+        if hasattr(self, 'primary_rpr_skip'):
+            self.__delattr__('primary_rpr_skip')
+        if hasattr(self, 'cheap_rpr_conv'):
+            self.__delattr__('cheap_rpr_conv')
+        if hasattr(self, 'cheap_rpr_scale'):
+            self.__delattr__('cheap_rpr_scale')
+        if hasattr(self, 'cheap_rpr_skip'):
+            self.__delattr__('cheap_rpr_skip')
+
+        self.infer_mode = True
+
+    def _get_kernel_bias_primary(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get re-parameterized kernel and bias for primary convolution."""
+        kernel_scale = 0
+        bias_scale = 0
+        if self.primary_rpr_scale is not None:
+            kernel_scale, bias_scale = self._fuse_bn_tensor(self.primary_rpr_scale)
+            pad = self.kernel_size // 2
+            kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
+
+        kernel_identity = 0
+        bias_identity = 0
+        if self.primary_rpr_skip is not None:
+            kernel_identity, bias_identity = self._fuse_bn_tensor(self.primary_rpr_skip)
+
+        kernel_conv = 0
+        bias_conv = 0
+        for ix in range(self.num_conv_branches):
+            _kernel, _bias = self._fuse_bn_tensor(self.primary_rpr_conv[ix])
+            kernel_conv += _kernel
+            bias_conv += _bias
+
+        return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
+
+    def _get_kernel_bias_cheap(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get re-parameterized kernel and bias for cheap operation."""
+        kernel_scale = 0
+        bias_scale = 0
+        if self.cheap_rpr_scale is not None:
+            kernel_scale, bias_scale = self._fuse_bn_tensor(self.cheap_rpr_scale)
+            pad = self.kernel_size // 2
+            kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
+
+        kernel_identity = 0
+        bias_identity = 0
+        if self.cheap_rpr_skip is not None:
+            kernel_identity, bias_identity = self._fuse_bn_tensor(self.cheap_rpr_skip)
+
+        kernel_conv = 0
+        bias_conv = 0
+        for ix in range(self.num_conv_branches):
+            _kernel, _bias = self._fuse_bn_tensor(self.cheap_rpr_conv[ix])
+            kernel_conv += _kernel
+            bias_conv += _bias
+
+        return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
+
+    def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse batchnorm layer with preceding conv layer."""
+        if isinstance(branch, nn.Sequential):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+        else:
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.in_channels // self.groups
+                kernel_value = torch.zeros((self.in_channels, input_dim, self.kernel_size, self.kernel_size),
+                                         dtype=branch.weight.dtype, device=branch.weight.device)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, self.kernel_size // 2, self.kernel_size // 2] = 1
+                self.id_tensor = kernel_value
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+        
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def _conv_bn(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, bias=False):
+        """Helper method to construct conv-batchnorm layers."""
+        mod_list = nn.Sequential()
+        mod_list.add_module('conv', nn.Conv2d(in_channels=in_channels,
+                                            out_channels=out_channels,
+                                            kernel_size=kernel_size,
+                                            stride=stride,
+                                            padding=padding,
+                                            groups=groups,
+                                            bias=bias))
+        mod_list.add_module('bn', nn.BatchNorm2d(out_channels))
+        return mod_list
 
 class RepConv(nn.Module):
     """
@@ -669,12 +908,12 @@ class Concat(nn.Module):
         super().__init__()
         self.d = dimension
 
-    def forward(self, x: List[torch.Tensor]):
+    def forward(self, x: list[torch.Tensor]):
         """
         Concatenate input tensors along specified dimension.
 
         Args:
-            x (List[torch.Tensor]): List of input tensors.
+            x (list[torch.Tensor]): List of input tensors.
 
         Returns:
             (torch.Tensor): Concatenated tensor.
@@ -700,12 +939,12 @@ class Index(nn.Module):
         super().__init__()
         self.index = index
 
-    def forward(self, x: List[torch.Tensor]):
+    def forward(self, x: list[torch.Tensor]):
         """
         Select and return a particular index from input.
 
         Args:
-            x (List[torch.Tensor]): List of input tensors.
+            x (list[torch.Tensor]): List of input tensors.
 
         Returns:
             (torch.Tensor): Selected tensor.

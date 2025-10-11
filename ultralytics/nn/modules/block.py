@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 
-from typing import List, Optional, Tuple
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -192,7 +192,7 @@ class HGBlock(nn.Module):
 class SPP(nn.Module):
     """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
 
-    def __init__(self, c1: int, c2: int, k: Tuple[int, ...] = (5, 9, 13)):
+    def __init__(self, c1: int, c2: int, k: tuple[int, ...] = (5, 9, 13)):
         """
         Initialize the SPP layer with input/output channels and pooling kernel sizes.
 
@@ -439,39 +439,267 @@ class C3Ghost(C3):
 
 
 class GhostBottleneck(nn.Module):
-    """Ghost Bottleneck https://github.com/huawei-noah/Efficient-AI-Backbones."""
+    """Ghost Bottleneck V3 with re-parameterization support."""
 
-    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1):
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1, se_ratio: float = 0.0, layer_id: int = 0):
         """
-        Initialize Ghost Bottleneck module.
+        Initialize Ghost Bottleneck V3 module.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
             k (int): Kernel size.
             s (int): Stride.
+            se_ratio (float): Squeeze-and-excitation ratio.
+            layer_id (int): Layer identifier for determining module type.
         """
         super().__init__()
-        c_ = c2 // 2
-        self.conv = nn.Sequential(
-            GhostConv(c1, c_, 1, 1),  # pw
-            DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-            GhostConv(c_, c2, 1, 1, act=False),  # pw-linear
-        )
-        self.shortcut = (
-            nn.Sequential(DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1, act=False)) if s == 2 else nn.Identity()
-        )
+        has_se = se_ratio is not None and se_ratio > 0.
+        self.stride = s
+        self.num_conv_branches = 3
+        self.infer_mode = False
+        self.dconv_scale = True
+
+        # Calculate middle channels (expansion)
+        mid_chs = c2 * 2  # Expansion ratio
+
+        # Point-wise expansion - use different modes based on layer_id
+        if layer_id <= 1:
+            self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
+        else:
+            # For deeper layers, could use enhanced version
+            self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
+
+        # Depth-wise convolution
+        if self.stride > 1:
+            if self.infer_mode:
+                self.conv_dw = nn.Conv2d(mid_chs, mid_chs, k, stride=s,
+                                       padding=(k-1)//2, groups=mid_chs, bias=False)
+                self.bn_dw = nn.BatchNorm2d(mid_chs)
+            else:
+                self.dw_rpr_skip = nn.BatchNorm2d(mid_chs) if s == 1 else None
+                dw_rpr_conv = []
+                for _ in range(self.num_conv_branches):
+                    dw_rpr_conv.append(self._conv_bn(mid_chs, mid_chs, k, s, (k-1)//2, groups=mid_chs, bias=False))
+                self.dw_rpr_conv = nn.ModuleList(dw_rpr_conv)
+                
+                self.dw_rpr_scale = None
+                if k > 1:
+                    self.dw_rpr_scale = self._conv_bn(mid_chs, mid_chs, 1, 2, 0, groups=mid_chs, bias=False)
+                self.kernel_size = k
+                self.in_channels = mid_chs
+                self.groups = mid_chs
+
+        # Squeeze-and-excitation
+        if has_se:
+            self.se = SqueezeExcite(mid_chs, se_ratio=se_ratio)
+        else:
+            self.se = None
+
+        # Point-wise linear projection
+        self.ghost2 = GhostConv(mid_chs, c2, k=1, act=False)
+        
+        # Shortcut connection
+        if (c1 == c2 and self.stride == 1):
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(c1, c1, k, stride=s, padding=(k-1)//2, groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+                nn.Conv2d(c1, c2, 1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(c2),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply skip connection and concatenation to input tensor."""
-        return self.conv(x) + self.shortcut(x)
+        residual = x
+
+        # 1st ghost bottleneck (expansion)
+        x = self.ghost1(x)
+
+        # Depth-wise convolution
+        if self.stride > 1:
+            if self.infer_mode:
+                x = self.conv_dw(x)
+                x = self.bn_dw(x)
+            else:
+                dw_identity_out = 0
+                if self.dw_rpr_skip is not None:
+                    dw_identity_out = self.dw_rpr_skip(x)
+                dw_scale_out = 0
+                if self.dw_rpr_scale is not None and self.dconv_scale:
+                    dw_scale_out = self.dw_rpr_scale(x)
+                x1 = dw_scale_out + dw_identity_out
+                for ix in range(self.num_conv_branches):
+                    x1 += self.dw_rpr_conv[ix](x)
+                x = x1
+
+        # Squeeze-and-excitation
+        if self.se is not None:
+            x = self.se(x)
+
+        # 2nd ghost bottleneck (compression)
+        x = self.ghost2(x)
+        
+        return x + self.shortcut(residual)
+
+    def reparameterize(self):
+        """Re-parameterize multi-branched architecture for inference."""
+        # Reparameterize ghost modules
+        if hasattr(self.ghost1, 'reparameterize'):
+            self.ghost1.reparameterize()
+        if hasattr(self.ghost2, 'reparameterize'):
+            self.ghost2.reparameterize()
+
+        # Reparameterize depth-wise convolution
+        if self.infer_mode or self.stride == 1:
+            return
+            
+        dw_kernel, dw_bias = self._get_kernel_bias_dw()
+        self.conv_dw = nn.Conv2d(
+            in_channels=self.dw_rpr_conv[0].conv.in_channels,
+            out_channels=self.dw_rpr_conv[0].conv.out_channels,
+            kernel_size=self.dw_rpr_conv[0].conv.kernel_size,
+            stride=self.dw_rpr_conv[0].conv.stride,
+            padding=self.dw_rpr_conv[0].conv.padding,
+            dilation=self.dw_rpr_conv[0].conv.dilation,
+            groups=self.dw_rpr_conv[0].conv.groups,
+            bias=True
+        )
+        self.conv_dw.weight.data = dw_kernel
+        self.conv_dw.bias.data = dw_bias
+        self.bn_dw = nn.Identity()
+
+        # Delete unused branches
+        for para in self.parameters():
+            para.detach_()
+        if hasattr(self, 'dw_rpr_conv'):
+            self.__delattr__('dw_rpr_conv')
+        if hasattr(self, 'dw_rpr_scale'):
+            self.__delattr__('dw_rpr_scale')
+        if hasattr(self, 'dw_rpr_skip'):
+            self.__delattr__('dw_rpr_skip')
+
+        self.infer_mode = True
+
+    def _get_kernel_bias_dw(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get re-parameterized kernel and bias for depth-wise convolution."""
+        kernel_scale = 0
+        bias_scale = 0
+        if self.dw_rpr_scale is not None:
+            kernel_scale, bias_scale = self._fuse_bn_tensor(self.dw_rpr_scale)
+            pad = self.kernel_size // 2
+            kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
+
+        kernel_identity = 0
+        bias_identity = 0
+        if self.dw_rpr_skip is not None:
+            kernel_identity, bias_identity = self._fuse_bn_tensor(self.dw_rpr_skip)
+
+        kernel_conv = 0
+        bias_conv = 0
+        for ix in range(self.num_conv_branches):
+            _kernel, _bias = self._fuse_bn_tensor(self.dw_rpr_conv[ix])
+            kernel_conv += _kernel
+            bias_conv += _bias
+
+        return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
+
+    def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse batchnorm layer with preceding conv layer."""
+        if isinstance(branch, nn.Sequential):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+        else:
+            assert isinstance(branch, nn.BatchNorm2d)
+            if not hasattr(self, 'id_tensor'):
+                input_dim = self.in_channels // self.groups
+                kernel_value = torch.zeros((self.in_channels, input_dim, self.kernel_size, self.kernel_size),
+                                         dtype=branch.weight.dtype, device=branch.weight.device)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, self.kernel_size // 2, self.kernel_size // 2] = 1
+                self.id_tensor = kernel_value
+            kernel = self.id_tensor
+            running_mean = branch.running_mean
+            running_var = branch.running_var
+            gamma = branch.weight
+            beta = branch.bias
+            eps = branch.eps
+            
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def _conv_bn(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, bias=False):
+        """Helper method to construct conv-batchnorm layers."""
+        mod_list = nn.Sequential()
+        mod_list.add_module('conv', nn.Conv2d(in_channels=in_channels,
+                                            out_channels=out_channels,
+                                            kernel_size=kernel_size,
+                                            stride=stride,
+                                            padding=padding,
+                                            groups=groups,
+                                            bias=bias))
+        mod_list.add_module('bn', nn.BatchNorm2d(out_channels))
+        return mod_list
+
+
+# Add SqueezeExcite module
+class SqueezeExcite(nn.Module):
+    """Squeeze-and-Excite attention module."""
+    
+    def __init__(self, in_chs: int, se_ratio: float = 0.25, reduced_base_chs: Optional[int] = None,
+                 act_layer: nn.Module = nn.ReLU, gate_fn = None, divisor: int = 4):
+        """
+        Initialize SqueezeExcite module.
+        
+        Args:
+            in_chs (int): Input channels.
+            se_ratio (float): Squeeze ratio.
+            reduced_base_chs (Optional[int]): Base channels for reduction.
+            act_layer (nn.Module): Activation layer.
+            gate_fn: Gate function (defaults to hard_sigmoid).
+            divisor (int): Divisor for making channels divisible.
+        """
+        super().__init__()
+        if gate_fn is None:
+            from .conv import hard_sigmoid
+            gate_fn = hard_sigmoid
+        self.gate_fn = gate_fn
+        reduced_chs = self._make_divisible((reduced_base_chs or in_chs) * se_ratio, divisor)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_reduce = nn.Conv2d(in_chs, reduced_chs, 1, bias=True)
+        self.act1 = act_layer(inplace=True)
+        self.conv_expand = nn.Conv2d(reduced_chs, in_chs, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply squeeze-and-excite attention to input."""
+        x_se = self.avg_pool(x)
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
+        return x * self.gate_fn(x_se)
+
+    @staticmethod
+    def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
+        """Make channels divisible by divisor."""
+        if min_value is None:
+            min_value = divisor
+        new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+        if new_v < 0.9 * v:
+            new_v += divisor
+        return new_v
 
 
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
 
     def __init__(
-        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: Tuple[int, int] = (3, 3), e: float = 0.5
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
     ):
         """
         Initialize a standard bottleneck module.
@@ -711,7 +939,7 @@ class ImagePoolingAttn(nn.Module):
     """ImagePoolingAttn: Enhance the text embeddings with image-aware information."""
 
     def __init__(
-        self, ec: int = 256, ch: Tuple[int, ...] = (), ct: int = 512, nh: int = 8, k: int = 3, scale: bool = False
+        self, ec: int = 256, ch: tuple[int, ...] = (), ct: int = 512, nh: int = 8, k: int = 3, scale: bool = False
     ):
         """
         Initialize ImagePoolingAttn module.
@@ -740,12 +968,12 @@ class ImagePoolingAttn(nn.Module):
         self.hc = ec // nh
         self.k = k
 
-    def forward(self, x: List[torch.Tensor], text: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: list[torch.Tensor], text: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of ImagePoolingAttn.
 
         Args:
-            x (List[torch.Tensor]): List of input feature maps.
+            x (list[torch.Tensor]): List of input feature maps.
             text (torch.Tensor): Text embeddings.
 
         Returns:
@@ -856,7 +1084,7 @@ class RepBottleneck(Bottleneck):
     """Rep bottleneck."""
 
     def __init__(
-        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: Tuple[int, int] = (3, 3), e: float = 0.5
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
     ):
         """
         Initialize RepBottleneck.
@@ -1026,13 +1254,13 @@ class SPPELAN(nn.Module):
 class CBLinear(nn.Module):
     """CBLinear."""
 
-    def __init__(self, c1: int, c2s: List[int], k: int = 1, s: int = 1, p: Optional[int] = None, g: int = 1):
+    def __init__(self, c1: int, c2s: list[int], k: int = 1, s: int = 1, p: int | None = None, g: int = 1):
         """
         Initialize CBLinear module.
 
         Args:
             c1 (int): Input channels.
-            c2s (List[int]): List of output channel sizes.
+            c2s (list[int]): List of output channel sizes.
             k (int): Kernel size.
             s (int): Stride.
             p (int | None): Padding.
@@ -1042,7 +1270,7 @@ class CBLinear(nn.Module):
         self.c2s = c2s
         self.conv = nn.Conv2d(c1, sum(c2s), k, s, autopad(k, p), groups=g, bias=True)
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Forward pass through CBLinear layer."""
         return self.conv(x).split(self.c2s, dim=1)
 
@@ -1050,22 +1278,22 @@ class CBLinear(nn.Module):
 class CBFuse(nn.Module):
     """CBFuse."""
 
-    def __init__(self, idx: List[int]):
+    def __init__(self, idx: list[int]):
         """
         Initialize CBFuse module.
 
         Args:
-            idx (List[int]): Indices for feature selection.
+            idx (list[int]): Indices for feature selection.
         """
         super().__init__()
         self.idx = idx
 
-    def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass through CBFuse layer.
 
         Args:
-            xs (List[torch.Tensor]): List of input tensors.
+            xs (list[torch.Tensor]): List of input tensors.
 
         Returns:
             (torch.Tensor): Fused output tensor.
@@ -1676,7 +1904,7 @@ class TorchVision(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            (torch.Tensor | List[torch.Tensor]): Output tensor or list of tensors.
+            (torch.Tensor | list[torch.Tensor]): Output tensor or list of tensors.
         """
         if self.split:
             y = [x]
@@ -1921,7 +2149,7 @@ class A2C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         y = self.cv2(torch.cat(y, 1))
         if self.gamma is not None:
-            return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y
+            return x + self.gamma.view(-1, self.gamma.shape[0], 1, 1) * y
         return y
 
 
@@ -1974,12 +2202,12 @@ class Residual(nn.Module):
 class SAVPE(nn.Module):
     """Spatial-Aware Visual Prompt Embedding module for feature enhancement."""
 
-    def __init__(self, ch: List[int], c3: int, embed: int):
+    def __init__(self, ch: list[int], c3: int, embed: int):
         """
         Initialize SAVPE module with channels, intermediate channels, and embedding dimension.
 
         Args:
-            ch (List[int]): List of input channel dimensions.
+            ch (list[int]): List of input channel dimensions.
             c3 (int): Intermediate channels.
             embed (int): Embedding dimension.
         """
@@ -2002,7 +2230,7 @@ class SAVPE(nn.Module):
         self.cv5 = nn.Conv2d(1, self.c, 3, padding=1)
         self.cv6 = nn.Sequential(Conv(2 * self.c, self.c, 3), nn.Conv2d(self.c, self.c, 3, padding=1))
 
-    def forward(self, x: List[torch.Tensor], vp: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: list[torch.Tensor], vp: torch.Tensor) -> torch.Tensor:
         """Process input features and visual prompts to generate enhanced embeddings."""
         y = [self.cv2[i](xi) for i, xi in enumerate(x)]
         y = self.cv4(torch.cat(y, dim=1))
