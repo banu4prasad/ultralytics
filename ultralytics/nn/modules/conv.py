@@ -398,7 +398,7 @@ class GhostConv(nn.Module):
             
             self.primary_rpr_scale = None
             if k > 1:
-                self.primary_rpr_scale = self._conv_bn(c1, init_channels, 1, 1, 0, bias=False)
+                self.primary_rpr_scale = self._conv_bn(c1, init_channels, 1, s, 0, bias=False)
             self.primary_activation = nn.ReLU(inplace=True) if act else None
 
             # Re-parameterizable cheap operation
@@ -431,28 +431,30 @@ class GhostConv(nn.Module):
             x2 = self.cheap_operation(x1)
         else:
             # Primary convolution with re-parameterization
-            identity_out = 0
-            if self.primary_rpr_skip is not None:
-                identity_out = self.primary_rpr_skip(x)
-            scale_out = 0
-            if self.primary_rpr_scale is not None and self.dconv_scale:
-                scale_out = self.primary_rpr_scale(x)
-            x1 = scale_out + identity_out
+            x1 = 0
             for ix in range(self.num_conv_branches):
                 x1 += self.primary_rpr_conv[ix](x)
+            
+            if self.primary_rpr_skip is not None:
+                x1 += self.primary_rpr_skip(x)
+            
+            if self.primary_rpr_scale is not None and self.dconv_scale:
+                x1 += self.primary_rpr_scale(x)
+            
             if self.primary_activation is not None:
                 x1 = self.primary_activation(x1)
 
             # Cheap operation with re-parameterization
-            cheap_identity_out = 0
-            if self.cheap_rpr_skip is not None:
-                cheap_identity_out = self.cheap_rpr_skip(x1)
-            cheap_scale_out = 0
-            if self.cheap_rpr_scale is not None and self.dconv_scale:
-                cheap_scale_out = self.cheap_rpr_scale(x1)
-            x2 = cheap_scale_out + cheap_identity_out
+            x2 = 0
             for ix in range(self.num_conv_branches):
                 x2 += self.cheap_rpr_conv[ix](x1)
+            
+            if self.cheap_rpr_skip is not None:
+                x2 += self.cheap_rpr_skip(x1)
+            
+            if self.cheap_rpr_scale is not None and self.dconv_scale:
+                x2 += self.cheap_rpr_scale(x1)
+            
             if self.cheap_activation is not None:
                 x2 = self.cheap_activation(x2)
 
@@ -523,19 +525,19 @@ class GhostConv(nn.Module):
 
         self.infer_mode = True
 
-    def _get_kernel_bias_primary(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_kernel_bias_primary(self):
         """Get re-parameterized kernel and bias for primary convolution."""
         kernel_scale = 0
         bias_scale = 0
         if self.primary_rpr_scale is not None:
             kernel_scale, bias_scale = self._fuse_bn_tensor(self.primary_rpr_scale)
-            pad = self.kernel_size // 2
+            pad = self.primary_rpr_conv[0].conv.kernel_size // 2
             kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
 
         kernel_identity = 0
         bias_identity = 0
         if self.primary_rpr_skip is not None:
-            kernel_identity, bias_identity = self._fuse_bn_tensor(self.primary_rpr_skip)
+            kernel_identity, bias_identity = self._fuse_bn_tensor(self.primary_rpr_skip, is_primary=True)
 
         kernel_conv = 0
         bias_conv = 0
@@ -546,7 +548,7 @@ class GhostConv(nn.Module):
 
         return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
 
-    def _get_kernel_bias_cheap(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_kernel_bias_cheap(self):
         """Get re-parameterized kernel and bias for cheap operation."""
         kernel_scale = 0
         bias_scale = 0
@@ -558,7 +560,7 @@ class GhostConv(nn.Module):
         kernel_identity = 0
         bias_identity = 0
         if self.cheap_rpr_skip is not None:
-            kernel_identity, bias_identity = self._fuse_bn_tensor(self.cheap_rpr_skip)
+            kernel_identity, bias_identity = self._fuse_bn_tensor(self.cheap_rpr_skip, is_primary=False)
 
         kernel_conv = 0
         bias_conv = 0
@@ -569,7 +571,7 @@ class GhostConv(nn.Module):
 
         return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
 
-    def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _fuse_bn_tensor(self, branch, is_primary=None):
         """Fuse batchnorm layer with preceding conv layer."""
         if isinstance(branch, nn.Sequential):
             kernel = branch.conv.weight
@@ -580,12 +582,23 @@ class GhostConv(nn.Module):
             eps = branch.bn.eps
         else:
             assert isinstance(branch, nn.BatchNorm2d)
-            if not hasattr(self, 'id_tensor'):
+            # Determine which identity tensor to create based on context
+            if is_primary is True:
+                # For primary skip connection
+                input_dim = self.primary_rpr_conv[0].conv.in_channels
+                output_dim = self.primary_rpr_conv[0].conv.out_channels
+                kernel_size = self.primary_rpr_conv[0].conv.kernel_size
+            else:
+                # For cheap skip connection
                 input_dim = self.in_channels // self.groups
-                kernel_value = torch.zeros((self.in_channels, input_dim, self.kernel_size, self.kernel_size),
+                output_dim = self.in_channels
+                kernel_size = self.kernel_size
+            
+            if not hasattr(self, 'id_tensor'):
+                kernel_value = torch.zeros((output_dim, input_dim, kernel_size, kernel_size),
                                          dtype=branch.weight.dtype, device=branch.weight.device)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim, self.kernel_size // 2, self.kernel_size // 2] = 1
+                for i in range(output_dim):
+                    kernel_value[i, i % input_dim, kernel_size // 2, kernel_size // 2] = 1
                 self.id_tensor = kernel_value
             kernel = self.id_tensor
             running_mean = branch.running_mean

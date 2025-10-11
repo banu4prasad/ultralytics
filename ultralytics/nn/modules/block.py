@@ -456,39 +456,21 @@ class GhostBottleneck(nn.Module):
         super().__init__()
         has_se = se_ratio is not None and se_ratio > 0.
         self.stride = s
-        self.num_conv_branches = 3
-        self.infer_mode = False
-        self.dconv_scale = True
 
         # Calculate middle channels (expansion)
         mid_chs = c2 * 2  # Expansion ratio
 
-        # Point-wise expansion - use different modes based on layer_id
-        if layer_id <= 1:
-            self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
-        else:
-            # For deeper layers, could use enhanced version
-            self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
+        # Point-wise expansion - use GhostConv instead of GhostModule
+        self.ghost1 = GhostConv(c1, mid_chs, k=1, act=True)
 
         # Depth-wise convolution
         if self.stride > 1:
-            if self.infer_mode:
-                self.conv_dw = nn.Conv2d(mid_chs, mid_chs, k, stride=s,
-                                       padding=(k-1)//2, groups=mid_chs, bias=False)
-                self.bn_dw = nn.BatchNorm2d(mid_chs)
-            else:
-                self.dw_rpr_skip = nn.BatchNorm2d(mid_chs) if s == 1 else None
-                dw_rpr_conv = []
-                for _ in range(self.num_conv_branches):
-                    dw_rpr_conv.append(self._conv_bn(mid_chs, mid_chs, k, s, (k-1)//2, groups=mid_chs, bias=False))
-                self.dw_rpr_conv = nn.ModuleList(dw_rpr_conv)
-                
-                self.dw_rpr_scale = None
-                if k > 1:
-                    self.dw_rpr_scale = self._conv_bn(mid_chs, mid_chs, 1, 2, 0, groups=mid_chs, bias=False)
-                self.kernel_size = k
-                self.in_channels = mid_chs
-                self.groups = mid_chs
+            self.conv_dw = nn.Conv2d(mid_chs, mid_chs, k, stride=s,
+                                   padding=(k-1)//2, groups=mid_chs, bias=False)
+            self.bn_dw = nn.BatchNorm2d(mid_chs)
+        else:
+            self.conv_dw = None
+            self.bn_dw = None
 
         # Squeeze-and-excitation
         if has_se:
@@ -519,20 +501,8 @@ class GhostBottleneck(nn.Module):
 
         # Depth-wise convolution
         if self.stride > 1:
-            if self.infer_mode:
-                x = self.conv_dw(x)
-                x = self.bn_dw(x)
-            else:
-                dw_identity_out = 0
-                if self.dw_rpr_skip is not None:
-                    dw_identity_out = self.dw_rpr_skip(x)
-                dw_scale_out = 0
-                if self.dw_rpr_scale is not None and self.dconv_scale:
-                    dw_scale_out = self.dw_rpr_scale(x)
-                x1 = dw_scale_out + dw_identity_out
-                for ix in range(self.num_conv_branches):
-                    x1 += self.dw_rpr_conv[ix](x)
-                x = x1
+            x = self.conv_dw(x)
+            x = self.bn_dw(x)
 
         # Squeeze-and-excitation
         if self.se is not None:
@@ -543,132 +513,28 @@ class GhostBottleneck(nn.Module):
         
         return x + self.shortcut(residual)
 
-    def reparameterize(self):
-        """Re-parameterize multi-branched architecture for inference."""
-        # Reparameterize ghost modules
-        if hasattr(self.ghost1, 'reparameterize'):
-            self.ghost1.reparameterize()
-        if hasattr(self.ghost2, 'reparameterize'):
-            self.ghost2.reparameterize()
 
-        # Reparameterize depth-wise convolution
-        if self.infer_mode or self.stride == 1:
-            return
-            
-        dw_kernel, dw_bias = self._get_kernel_bias_dw()
-        self.conv_dw = nn.Conv2d(
-            in_channels=self.dw_rpr_conv[0].conv.in_channels,
-            out_channels=self.dw_rpr_conv[0].conv.out_channels,
-            kernel_size=self.dw_rpr_conv[0].conv.kernel_size,
-            stride=self.dw_rpr_conv[0].conv.stride,
-            padding=self.dw_rpr_conv[0].conv.padding,
-            dilation=self.dw_rpr_conv[0].conv.dilation,
-            groups=self.dw_rpr_conv[0].conv.groups,
-            bias=True
-        )
-        self.conv_dw.weight.data = dw_kernel
-        self.conv_dw.bias.data = dw_bias
-        self.bn_dw = nn.Identity()
-
-        # Delete unused branches
-        for para in self.parameters():
-            para.detach_()
-        if hasattr(self, 'dw_rpr_conv'):
-            self.__delattr__('dw_rpr_conv')
-        if hasattr(self, 'dw_rpr_scale'):
-            self.__delattr__('dw_rpr_scale')
-        if hasattr(self, 'dw_rpr_skip'):
-            self.__delattr__('dw_rpr_skip')
-
-        self.infer_mode = True
-
-    def _get_kernel_bias_dw(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get re-parameterized kernel and bias for depth-wise convolution."""
-        kernel_scale = 0
-        bias_scale = 0
-        if self.dw_rpr_scale is not None:
-            kernel_scale, bias_scale = self._fuse_bn_tensor(self.dw_rpr_scale)
-            pad = self.kernel_size // 2
-            kernel_scale = torch.nn.functional.pad(kernel_scale, [pad, pad, pad, pad])
-
-        kernel_identity = 0
-        bias_identity = 0
-        if self.dw_rpr_skip is not None:
-            kernel_identity, bias_identity = self._fuse_bn_tensor(self.dw_rpr_skip)
-
-        kernel_conv = 0
-        bias_conv = 0
-        for ix in range(self.num_conv_branches):
-            _kernel, _bias = self._fuse_bn_tensor(self.dw_rpr_conv[ix])
-            kernel_conv += _kernel
-            bias_conv += _bias
-
-        return kernel_conv + kernel_scale + kernel_identity, bias_conv + bias_scale + bias_identity
-
-    def _fuse_bn_tensor(self, branch) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fuse batchnorm layer with preceding conv layer."""
-        if isinstance(branch, nn.Sequential):
-            kernel = branch.conv.weight
-            running_mean = branch.bn.running_mean
-            running_var = branch.bn.running_var
-            gamma = branch.bn.weight
-            beta = branch.bn.bias
-            eps = branch.bn.eps
-        else:
-            assert isinstance(branch, nn.BatchNorm2d)
-            if not hasattr(self, 'id_tensor'):
-                input_dim = self.in_channels // self.groups
-                kernel_value = torch.zeros((self.in_channels, input_dim, self.kernel_size, self.kernel_size),
-                                         dtype=branch.weight.dtype, device=branch.weight.device)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim, self.kernel_size // 2, self.kernel_size // 2] = 1
-                self.id_tensor = kernel_value
-            kernel = self.id_tensor
-            running_mean = branch.running_mean
-            running_var = branch.running_var
-            gamma = branch.weight
-            beta = branch.bias
-            eps = branch.eps
-            
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta - running_mean * gamma / std
-
-    def _conv_bn(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, bias=False):
-        """Helper method to construct conv-batchnorm layers."""
-        mod_list = nn.Sequential()
-        mod_list.add_module('conv', nn.Conv2d(in_channels=in_channels,
-                                            out_channels=out_channels,
-                                            kernel_size=kernel_size,
-                                            stride=stride,
-                                            padding=padding,
-                                            groups=groups,
-                                            bias=bias))
-        mod_list.add_module('bn', nn.BatchNorm2d(out_channels))
-        return mod_list
-
-
-# Add SqueezeExcite module
+# Remove the old SqueezeExcite class and update it with proper typing
 class SqueezeExcite(nn.Module):
     """Squeeze-and-Excite attention module."""
     
-    def __init__(self, in_chs: int, se_ratio: float = 0.25, reduced_base_chs: Optional[int] = None,
-                 act_layer: nn.Module = nn.ReLU, gate_fn = None, divisor: int = 4):
+    def __init__(self, in_chs: int, se_ratio: float = 0.25, reduced_base_chs: int | None = None,
+                 act_layer: type[nn.Module] = nn.ReLU, gate_fn = None, divisor: int = 4):
         """
         Initialize SqueezeExcite module.
         
         Args:
             in_chs (int): Input channels.
             se_ratio (float): Squeeze ratio.
-            reduced_base_chs (Optional[int]): Base channels for reduction.
-            act_layer (nn.Module): Activation layer.
+            reduced_base_chs (int | None): Base channels for reduction.
+            act_layer (type[nn.Module]): Activation layer.
             gate_fn: Gate function (defaults to hard_sigmoid).
             divisor (int): Divisor for making channels divisible.
         """
         super().__init__()
         if gate_fn is None:
-            from .conv import hard_sigmoid
-            gate_fn = hard_sigmoid
+            # Use hard sigmoid as default
+            gate_fn = lambda x: F.relu6(x + 3.) / 6.
         self.gate_fn = gate_fn
         reduced_chs = self._make_divisible((reduced_base_chs or in_chs) * se_ratio, divisor)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -685,7 +551,7 @@ class SqueezeExcite(nn.Module):
         return x * self.gate_fn(x_se)
 
     @staticmethod
-    def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
+    def _make_divisible(v: float, divisor: int, min_value: int | None = None) -> int:
         """Make channels divisible by divisor."""
         if min_value is None:
             min_value = divisor
