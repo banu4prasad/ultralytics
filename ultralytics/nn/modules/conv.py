@@ -8,6 +8,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -337,6 +338,7 @@ class GhostConv(nn.Module):
     Attributes:
         mode (str): Operation mode ('original' or 'attn').
         oup (int): Output channels.
+        stride (int): Stride for convolution.
         primary_conv (nn.Sequential): Primary convolution path.
         cheap_operation (nn.Sequential): Cheap operation path.
         short_conv (nn.Sequential | None): Short convolution for attention mode.
@@ -353,19 +355,21 @@ class GhostConv(nn.Module):
         Args:
             c1 (int): Number of input channels.
             c2 (int): Number of output channels.
-            k (int): Kernel size.
+            k (int): Kernel size for primary conv.
             s (int): Stride.
-            g (int): Groups (not used in GhostNetV2).
-            act (bool | nn.Module): Activation function.
+            g (int): Groups (not used in GhostNetV2, kept for compatibility).
+            act (bool): Whether to use activation.
             mode (str): Mode 'original' or 'attn'.
-            dw_size (int): Depthwise convolution kernel size.
+            dw_size (int): Depthwise convolution kernel size for cheap operation.
             ratio (int): Channel expansion ratio.
         """
         super().__init__()
         self.mode = mode
         self.gate_fn = nn.Sigmoid()
         self.oup = c2
+        self.stride = s
         
+        # Calculate channel splits
         init_channels = math.ceil(c2 / ratio)
         new_channels = init_channels * (ratio - 1)
         
@@ -376,7 +380,7 @@ class GhostConv(nn.Module):
             nn.ReLU(inplace=True) if act else nn.Identity(),
         )
         
-        # Cheap operation
+        # Cheap operation (depthwise conv)
         self.cheap_operation = nn.Sequential(
             nn.Conv2d(init_channels, new_channels, dw_size, 1, dw_size // 2, 
                      groups=init_channels, bias=False),
@@ -415,17 +419,16 @@ class GhostConv(nn.Module):
             out = torch.cat([x1, x2], dim=1)
             return out[:, :self.oup, :, :]
         elif self.mode == 'attn':
-            #apply average pooling only when stride is 1
-            if self.stride == 1:
-                res = self.short_conv(torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2))
-            else:
-                res = self.short_conv(x)
+            # Apply avg pooling with stride=2 for downsampling before short_conv
+            res = self.short_conv(F.avg_pool2d(x, kernel_size=2, stride=2))
             
             x1 = self.primary_conv(x)
             x2 = self.cheap_operation(x1)
             out = torch.cat([x1, x2], dim=1)
             out = out[:, :self.oup, :, :]
-            return out * torch.nn.functional.interpolate(
+            
+            # Interpolate attention map to match output size
+            return out * F.interpolate(
                 self.gate_fn(res), 
                 size=(out.shape[-2], out.shape[-1]), 
                 mode='nearest'
