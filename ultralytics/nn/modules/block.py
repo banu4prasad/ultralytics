@@ -13,43 +13,43 @@ from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
-    "DFL",
-    "HGBlock",
-    "HGStem",
-    "SPP",
-    "SPPF",
     "C1",
     "C2",
+    "C2PSA",
     "C3",
-    "C2f",
-    "C2fAttn",
-    "ImagePoolingAttn",
-    "ContrastiveHead",
-    "BNContrastiveHead",
-    "C3x",
     "C3TR",
-    "C3Ghost",
-    "GhostBottleneck",
+    "CIB",
+    "DFL",
+    "ELAN1",
+    "PSA",
+    "SPP",
+    "SPPELAN",
+    "SPPF",
+    "AConv",
+    "ADown",
+    "Attention",
+    "BNContrastiveHead",
     "Bottleneck",
     "BottleneckCSP",
-    "Proto",
-    "RepC3",
-    "ResNetLayer",
-    "RepNCSPELAN4",
-    "ELAN1",
-    "ADown",
-    "AConv",
-    "SPPELAN",
+    "C2f",
+    "C2fAttn",
+    "C2fCIB",
+    "C2fPSA",
+    "C3Ghost",
+    "C3k2",
+    "C3x",
     "CBFuse",
     "CBLinear",
-    "C3k2",
-    "C2fPSA",
-    "C2PSA",
+    "ContrastiveHead",
+    "GhostBottleneck",
+    "HGBlock",
+    "HGStem",
+    "ImagePoolingAttn",
+    "Proto",
+    "RepC3",
+    "RepNCSPELAN4",
     "RepVGGDW",
-    "CIB",
-    "C2fCIB",
-    "Attention",
-    "PSA",
+    "ResNetLayer",
     "SCDown",
     "TorchVision",
 )
@@ -419,12 +419,14 @@ class C3TR(C3):
 
 
 class C3Ghost(C3):
-    """C3 module with GhostBottleneck(). """
+    """C3 module with GhostBottleneck()."""
 
-    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, layer_id: int = 0, g: int = 1, e: float = 0.5):
+    def __init__(
+        self, c1: int, c2: int, n: int = 1, shortcut: bool = True, layer_id: int = 0, g: int = 1, e: float = 0.5
+    ):
         """
         Initialize C3 module with GhostBottleneck.
-        
+
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
@@ -437,6 +439,7 @@ class C3Ghost(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(GhostBottleneck(c_, c_, layer_id=layer_id + i) for i in range(n)))
+
 
 class GhostBottleneck(nn.Module):
     """Ghost Bottleneck https://github.com/huawei-noah/Efficient-AI-Backbones."""
@@ -456,17 +459,16 @@ class GhostBottleneck(nn.Module):
         c_ = c2 // 2
 
         # Skip attention for first 2 bottleneck (layer_id 0 and 1) as per paper: https://arxiv.org/abs/2211.12905
-        ghost1_mode = 'attn' if layer_id > 1 else 'original'
-        
+        ghost1_mode = "attn" if layer_id > 1 else "original"
+
         self.conv = nn.Sequential(
             GhostConv(c1, c_, 1, 1, mode=ghost1_mode),  # pw with DFC attention
             DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-            GhostConv(c_, c2, 1, 1, act=False, mode='original'),  # pw-linear
+            GhostConv(c_, c2, 1, 1, act=False, mode="original"),  # pw-linear
         )
-        
+
         self.shortcut = (
-            nn.Sequential(DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1, act=False)) 
-            if s == 2 else nn.Identity()
+            nn.Sequential(DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1, act=False)) if s == 2 else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

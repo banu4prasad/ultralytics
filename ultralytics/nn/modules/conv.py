@@ -11,20 +11,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = (
+    "CBAM",
+    "ChannelAttention",
+    "Concat",
     "Conv",
     "Conv2",
-    "LightConv",
+    "ConvTranspose",
     "DWConv",
     "DWConvTranspose2d",
-    "ConvTranspose",
     "Focus",
     "GhostConv",
-    "ChannelAttention",
-    "SpatialAttention",
-    "CBAM",
-    "Concat",
-    "RepConv",
     "Index",
+    "LightConv",
+    "RepConv",
+    "SpatialAttention",
 )
 
 
@@ -342,7 +342,7 @@ class GhostConv(nn.Module):
         https://github.com/huawei-noah/Efficient-AI-Backbones
     """
 
-    def __init__(self, c1, c2, k=1, s=1, g=1, act=True, mode='original'):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True, mode="original"):
         """
         Initialize Ghost Convolution module with given parameters.
         
@@ -390,8 +390,9 @@ class GhostConv(nn.Module):
             if attn.shape[-2:] != out.shape[-2:]:
                 attn = F.interpolate(attn, size=out.shape[-2:], mode='nearest')
             attn = self.gate(attn)
-            return out * (1 + self.gamma * (attn - 0.5)) 
+            return out * (1 + self.gamma * (attn - 0.5))
         return out
+
 
 class RepConv(nn.Module):
     """
